@@ -38,7 +38,7 @@ setuptools.setup(
     long_description_content_type='text/markdown',
     author='Google Inc.',
     author_email='no-reply@google.com',
-    url='http://github.com/google/seqio',
+    url='http://github.com/XueFuzhao/seqio',
     license='Apache 2.0',
     packages=setuptools.find_packages(),
     include_package_data=True,
