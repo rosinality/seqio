@@ -192,7 +192,7 @@ class LazyTfdsLoader(object):
         data_dir=self.data_dir,
         shuffle_files=shuffle_files,
         download=True,
-        try_gcs=True,
+        try_gcs=False if self.data_dir!=None else True,
         read_config=read_config,
         decoders=self._decoders,
     )
