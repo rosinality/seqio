@@ -452,6 +452,38 @@ class PreprocessorsTest(tf.test.TestCase):
     # in the same order as they are in original unpacked_datatset.
     assert_dataset(packed_ds, expected)
 
+  def test_preprocess_tensorflow_examples(self):
+    og_dataset = tf.data.Dataset.from_tensors(
+        {'text': 'Hello', 'label': 'World'}
+    )
+
+    inputs_format = 'Input: {text}'
+    targets_format = 'Output: {label}'
+
+    dataset = preprocessors.preprocess_tensorflow_examples(
+        og_dataset, inputs_format, targets_format
+    )
+
+    assert_dataset(
+        dataset, {'inputs': 'Input: Hello', 'targets': 'Output: World'}
+    )
+
+  def test_preprocess_tensorflow_examples_with_special_chars(self):
+    og_dataset = tf.data.Dataset.from_tensors(
+        {'text': 'Hello\\nWorld', 'label': 'Hello\\tGoogle'}
+    )
+
+    inputs_format = 'Input: {text}'
+    targets_format = 'Output: {label}'
+
+    dataset = preprocessors.preprocess_tensorflow_examples(
+        og_dataset, inputs_format, targets_format
+    )
+
+    assert_dataset(
+        dataset,
+        {'inputs': 'Input: Hello\\nWorld', 'targets': 'Output: Hello\\tGoogle'},
+    )
 
 if __name__ == '__main__':
   absltest.main()

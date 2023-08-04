@@ -82,7 +82,7 @@ input dataset.
 import abc
 import dataclasses
 import functools
-from typing import Mapping, Sequence
+from typing import Mapping, Optional, Sequence
 from absl import logging
 
 from seqio import utils
@@ -150,7 +150,23 @@ def _check_lengths(
 
     expected_length = tf.constant(expected_lengths[feat], dtype=tf.int64)
     sequence_axis = sequence_axis_mapping[feat]
-    actual_length = tf.shape(v, out_type=tf.int64)[sequence_axis]
+    if isinstance(v, tf.RaggedTensor):
+      if strict:
+        # For strict mode we require all sequence dim lengths be equal.
+        # We multiply by [1] to (potentially) broadcast to 1d since non-ragged
+        # dimensions will return scalar rather than vector row_lengths.
+        lengths = v.row_lengths(sequence_axis) * tf.constant(
+            [1], dtype=tf.int64
+        )
+        tf.debugging.assert_equal(
+            len(tf.unique(lengths)[0]),
+            1,
+            "Strict length check requires all RaggedTensor dimensions to be"
+            f" equal, got {v.row_lengths()}",
+        )
+      actual_length = v.bounding_shape(axis=sequence_axis, out_type=tf.int64)
+    else:
+      actual_length = tf.shape(v, out_type=tf.int64)[sequence_axis]
     assertion_op(actual_length, expected_length)
     return v
 
@@ -231,12 +247,20 @@ class FeatureConverter(abc.ABC):
     used, they must override PACKING_FEATURE_DTYPES as well. These are the
     packing-specific features such as "*_segment_ids".
 
+    Pass-through features are incompatible with packing and should not be used
+    in that case. FeatureConverter only implements the scaffolding, but the real
+    pass-through should be implemented in each sub-class inside
+    `_convert_features` and `get_model_feature_lengths`.
+
   Attributes:
     pack: whether to pack the dataset.
     use_custom_packing_ops: whether to use custom ops for packing.
     apply_length_check: if True, it checks whether output feature lengths are
       less than the lengths given by `sequence_length`.
     bos_id: bos id for decoder inputs.
+    passthrough_features: a mapping that extends the `TASK_FEATURES` and
+      `MODEL_FEATURES` including features that will pass through without any
+      processing.
   """
 
   @dataclasses.dataclass(frozen=True)
@@ -257,6 +281,8 @@ class FeatureConverter(abc.ABC):
       use_custom_packing_ops: bool = False,
       apply_length_check: bool = True,
       bos_id: int = 0,
+      passthrough_features: Optional[
+          Mapping[str, "FeatureConverter.FeatureSpec"]] = None,
   ):
     self._pack = pack
     self._use_custom_packing_ops = use_custom_packing_ops
@@ -273,6 +299,13 @@ class FeatureConverter(abc.ABC):
       raise ValueError(
           "PACKING_FEATURE_DTYPES must be defined in the subclass if pack=True."
       )
+
+    if passthrough_features is not None:
+      if self.pack:
+        raise ValueError("Packing is incompatible with pass-through features.")
+      self._passthrough_features = passthrough_features
+    else:
+      self._passthrough_features = {}
 
   def _validate_dataset(
       self,
@@ -334,6 +367,12 @@ class FeatureConverter(abc.ABC):
 
     sequence_axis_mapping = {
         feat: expected_features[feat].sequence_dim for feat in expected_features
+    }
+    # Remove rank-0 features from expected lengths to bypass the length check.
+    expected_lengths = {
+        k: v
+        for k, v in expected_lengths.items()
+        if k in expected_features and expected_features[k].rank != 0
     }
     if self._apply_length_check:
       ds = _check_lengths(
@@ -422,8 +461,10 @@ class FeatureConverter(abc.ABC):
       ds: the converted dataset.
     """
     # Validation 1
+    task_features_with_passthrough = dict(self.TASK_FEATURES)
+    task_features_with_passthrough.update(self._passthrough_features)
     _check_exact_match(
-        expected_features=list(self.TASK_FEATURES),
+        expected_features=list(task_features_with_passthrough),
         actual_features=list(task_feature_lengths),
         expected_feature_source="TASK_FEATURES",
         actual_feature_source="task_feature_lengths",
@@ -432,7 +473,7 @@ class FeatureConverter(abc.ABC):
     # Validation 2
     ds = self._validate_dataset(
         ds,
-        expected_features=self.TASK_FEATURES,
+        expected_features=task_features_with_passthrough,
         expected_lengths=task_feature_lengths,
         # Before pack/pad, check feature (of ds) length <= task feature length
         strict=False,
@@ -443,6 +484,7 @@ class FeatureConverter(abc.ABC):
     ds = self._convert_features(ds, task_feature_lengths)
 
     expected_features = dict(self.MODEL_FEATURES)
+    expected_features.update(self._passthrough_features)
     if self.pack:
       for k, v in expected_features.items():
         # Packing requires rank 1.
@@ -598,6 +640,7 @@ class EncDecFeatureConverter(FeatureConverter):
         # Loss is computed for all but the padding positions.
         "decoder_loss_weights": non_padding_position(features["targets"]),
     }
+    d.update({k: features[k] for k in self._passthrough_features})
 
     if self.pack:
       d["encoder_segment_ids"] = features["inputs_segment_ids"]
@@ -650,6 +693,9 @@ class EncDecFeatureConverter(FeatureConverter):
         "decoder_input_tokens": decoder_length,
         "decoder_loss_weights": decoder_length,
     }
+    for k in self._passthrough_features:
+      model_feature_lengths[k] = task_feature_lengths[k]
+
     if self.pack:
       model_feature_lengths["encoder_segment_ids"] = encoder_length
       model_feature_lengths["decoder_segment_ids"] = decoder_length
@@ -1034,6 +1080,7 @@ class PrefixLMFeatureConverter(LMFeatureConverter):
           dtype=features["targets"].dtype,
       )
 
+    d.update({k: features[k] for k in self._passthrough_features})
     return d
 
   def _concat_and_add_masks(
@@ -1059,21 +1106,28 @@ class PrefixLMFeatureConverter(LMFeatureConverter):
         [tf.size(inputs) + tf.size(targets)], width + 1
     )
 
-    return {
+    d = {
         "targets": tf.concat([inputs, targets], axis=-1),
         "inputs_width": inputs_width,
         "inputs_width_add_pos": inputs_width_add_pos,
     }
+    d.update({k: features[k] for k in self._passthrough_features})
+    return d
 
   def _concat_task_feature_lengths(
       self, task_feature_lengths: Mapping[str, int]
   ) -> Mapping[str, int]:
-    concat_length = sum(task_feature_lengths.values())
-    return {
+    concat_length = sum(
+        v for k, v in task_feature_lengths.items()
+        if k not in self._passthrough_features)
+    task_lengths = {
         "targets": concat_length,
         "inputs_width": concat_length,
         "inputs_width_add_pos": concat_length,
     }
+    for k in self._passthrough_features:
+      task_lengths[k] = task_feature_lengths[k]
+    return task_lengths
 
   def _convert_features(
       self, ds: tf.data.Dataset, task_feature_lengths: Mapping[str, int]
@@ -1128,11 +1182,15 @@ class PrefixLMFeatureConverter(LMFeatureConverter):
       self, task_feature_lengths: Mapping[str, int]
   ) -> Mapping[str, int]:
     """Define the length relationship between task and model features."""
-    decoder_length = sum(task_feature_lengths.values())
+    decoder_length = sum(
+        v for k, v in task_feature_lengths.items()
+        if k not in self._passthrough_features)
     concat_length = {"targets": decoder_length}
     lm_model_feature_lengths = super().get_model_feature_lengths(concat_length)
     model_feature_lengths = dict(lm_model_feature_lengths)
     model_feature_lengths["decoder_causal_attention"] = decoder_length
+    for k in self._passthrough_features:
+      model_feature_lengths[k] = task_feature_lengths[k]
     return model_feature_lengths
 
   @property
@@ -1303,6 +1361,8 @@ class DecoderFeatureConverter(FeatureConverter):
       use_custom_packing_ops: bool = False,
       apply_length_check: bool = True,
       bos_id: int = 0,
+      passthrough_features: Optional[
+          Mapping[str, FeatureConverter.FeatureSpec]] = None,
   ) -> None:
     self._loss_on_targets_only = loss_on_targets_only
     super().__init__(
@@ -1310,6 +1370,7 @@ class DecoderFeatureConverter(FeatureConverter):
         use_custom_packing_ops=use_custom_packing_ops,
         apply_length_check=apply_length_check,
         bos_id=bos_id,
+        passthrough_features=passthrough_features,
     )
     self.prefixlm_feature_converter = PrefixLMFeatureConverter(
         loss_on_targets_only=loss_on_targets_only,
@@ -1317,6 +1378,7 @@ class DecoderFeatureConverter(FeatureConverter):
         use_custom_packing_ops=use_custom_packing_ops,
         apply_length_check=apply_length_check,
         bos_id=bos_id,
+        passthrough_features=passthrough_features,
     )
     self.strictlm_feature_converter = LMFeatureConverter(
         pack=pack,
@@ -1335,6 +1397,8 @@ class DecoderFeatureConverter(FeatureConverter):
   def __call__(
       self, ds: tf.data.Dataset, task_feature_lengths: Mapping[str, int]
   ) -> tf.data.Dataset:
+    # NOTE: __call__ can safely be overridden here because it is delegated to
+    # other FeatureConverters - invoking their __call__ and associated checks.
     if "suffixes" in task_feature_lengths:
       return self.prefixsuffixlm_feature_converter(ds, task_feature_lengths)
     if "inputs" in task_feature_lengths:

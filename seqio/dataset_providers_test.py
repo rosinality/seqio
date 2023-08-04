@@ -1943,12 +1943,6 @@ def register_dummy_task(
 
 class TfdsDataSourceTest(test_utils.FakeTaskTest):
 
-  def test_no_tfds_version(self):
-    with self.assertRaisesWithLiteralMatch(
-        ValueError, "TFDS name must contain a version number, got: fake"
-    ):
-      dataset_providers.TfdsDataSource(tfds_name="fake")
-
   def test_tfds_splits(self):
     self.assertSameElements(
         ["train", "validation"],
@@ -2012,11 +2006,18 @@ class FunctionDataSourceTest(test_utils.FakeTaskTest):
 
     dataset_providers.FunctionDataSource(extra_kwarg_good_fn, splits=("train",))
 
+    class GoodProtocol(dataset_providers.DatasetFnCallable):
+
+      def __call__(self, split, shuffle_files, seed=None):
+        del split, shuffle_files, seed
+
+    dataset_providers.FunctionDataSource(GoodProtocol(), splits=("train",))
+
     # Bad signatures.
     with self.assertRaisesWithLiteralMatch(
         ValueError,
         (
-            "'missing_shuff' must have positional args ('split',"
+            "'missing_shuff' must have initial args ('split',"
             " 'shuffle_files'), got: ('split',)"
         ),
     ):
@@ -2029,7 +2030,7 @@ class FunctionDataSourceTest(test_utils.FakeTaskTest):
     with self.assertRaisesWithLiteralMatch(
         ValueError,
         (
-            "'missing_split' must have positional args ('split',"
+            "'missing_split' must have initial args ('split',"
             " 'shuffle_files'), got: ('shuffle_files',)"
         ),
     ):
@@ -2056,6 +2057,33 @@ class FunctionDataSourceTest(test_utils.FakeTaskTest):
 
 
 class FileDataSourceTest(test_utils.FakeTaskTest):
+
+  def test_str(self):
+    fds = dataset_providers.FileDataSource(
+        read_file_fn=lambda x: tf.data.Dataset.from_tensor_slices([x]),
+        split_to_filepattern={"train": "filepattern"},
+        file_shuffle_buffer_size=2,
+        cycle_length=42,
+    )
+    self.assertEqual(str(fds), "FileDataSource({'train': 'filepattern'})")
+
+  def test_repr(self):
+    fds = dataset_providers.FileDataSource(
+        read_file_fn=lambda x: tf.data.Dataset.from_tensor_slices([x]),
+        split_to_filepattern={"train": "filepattern"},
+        file_shuffle_buffer_size=2,
+        cycle_length=42,
+    )
+    self.assertEqual(
+        fds.__repr__(),
+        "FileDataSource("
+        "split_to_filepattern={'train': 'filepattern'},"
+        " num_input_examples=None,"
+        " caching_permitted=True,"
+        " file_shuffle_buffer_size=2,"
+        " cycle_length=42,"
+        " block_length=16)",
+    )
 
   @mock.patch.object(dataset_providers, "_list_files")
   def test_file_data_source_shuffle_buffer_low(self, mock_list_files):
@@ -2140,6 +2168,37 @@ class FileDataSourceTest(test_utils.FakeTaskTest):
       )
 
 
+
+class ProtoDataSource(test_utils.FakeTaskTest):
+
+  def test_str(self):
+    self.assertEqual(
+        str(self.proto_source),
+        f"ProtoDataSource({{'train': '{self.test_data_dir}/train.tfrecord*'}})",
+    )
+
+  def test_repr(self):
+    expected = (
+        "ProtoDataSource(split_to_filepattern={'train':"
+        f" '{self.test_data_dir}/train.tfrecord*'}}, num_input_examples=None,"
+        " caching_permitted=True, file_shuffle_buffer_size=None,"
+        " cycle_length=16, block_length=16)"
+    )
+    self.assertEqual(self.proto_source.__repr__(), expected)
+
+
+
+class TFExampleDataSource(test_utils.FakeTaskTest):
+
+  def test_str(self):
+    expected = (
+        "TFExampleDataSource(split_to_filepattern="
+        f"{{'train': '{self.test_data_dir}/train.tfrecord*'}},"
+        " feature_description={'prefix': FixedLenFeature(shape=[],"
+        " dtype=tf.string, default_value=None), 'suffix':"
+        " FixedLenFeature(shape=[], dtype=tf.string, default_value=None)})"
+    )
+    self.assertEqual(str(self.tf_example_source), expected)
 
 
 

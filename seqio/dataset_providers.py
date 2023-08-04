@@ -29,6 +29,7 @@ import operator
 import os
 import re
 from typing import Any, Callable, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple, Type, Union
+
 from absl import logging
 import clu.metrics
 import editdistance
@@ -45,6 +46,7 @@ from seqio.vocabularies import Vocabulary
 import tensorflow.compat.v2 as tf
 import tensorflow_datasets as tfds
 import typing_extensions
+
 
 _DEFAULT_FEATURE_KEYS = ["inputs", "targets"]
 
@@ -350,25 +352,22 @@ class DataSource(DatasetProviderBase):
 
 
 
-def _validate_args(fn, expected_pos_args):
-  """Ensure function has exactly expected positional args."""
-  argspec = inspect.getfullargspec(fn)
-  expected_pos_args = tuple(expected_pos_args)
-  actual_args = tuple(argspec.args)
-  if actual_args[: len(expected_pos_args)] != expected_pos_args:
+def _validate_args(fn, expected_args: Sequence[str]):
+  """Ensure function/protocol is callable with exactly expected args."""
+  params = tuple(inspect.signature(fn).parameters.values())
+  actual_args = tuple(p.name for p in params)
+  expected_args = tuple(expected_args)
+
+  if actual_args[: len(expected_args)] != expected_args:
     raise ValueError(
-        "'%s' must have positional args %s, got: %s"
-        % (utils.function_name(fn), expected_pos_args, actual_args)
+        "'%s' must have initial args %s, got: %s"
+        % (utils.function_name(fn), expected_args, actual_args)
     )
-  actual_pos_args = tuple(
-      argspec.args[: -len(argspec.defaults)]
-      if argspec.defaults
-      else argspec.args
-  )
-  if actual_pos_args != expected_pos_args[: len(actual_pos_args)]:
+  actual_nondefault_args = tuple(p.name for p in params if p.default == p.empty)
+  if actual_nondefault_args != expected_args[: len(actual_nondefault_args)]:
     raise ValueError(
         "'%s' may only have positional args %s, got: %s"
-        % (utils.function_name(fn), expected_pos_args, actual_pos_args)
+        % (utils.function_name(fn), expected_args, actual_nondefault_args)
     )
 
 
@@ -419,6 +418,15 @@ class FunctionDataSource(DataSource):
   @property
   def supports_arbitrary_sharding(self) -> bool:
     return False
+
+  def __repr__(self):
+    return (
+        f"{self.__class__.__name__}("
+        f"dataset_fn={utils.function_name(self._dataset_fn)},"
+        f" splits={self.splits},"
+        f" num_input_examples={self._num_input_examples},"
+        f" caching_permitted={self.caching_permitted})"
+    )
 
   def get_dataset(
       self,
@@ -487,11 +495,6 @@ class TfdsDataSource(DataSource):
       decoders: dict (optional), mapping from features to tfds.decode.Decoders,
         such as tfds.decode.SkipDecoding() for skipping image byte decoding
     """
-    if tfds_name and ":" not in tfds_name:
-      raise ValueError(
-          f"TFDS name must contain a version number, got: {tfds_name}"
-      )
-
     if splits and not isinstance(splits, dict):
       splits = {k: k for k in splits}
 
@@ -512,12 +515,21 @@ class TfdsDataSource(DataSource):
     return self._splits or self._tfds_dataset.info.splits
 
   @property
-  def tfds_dataset(self):
+  def tfds_dataset(self) -> utils.LazyTfdsLoader:
     return self._tfds_dataset
 
   @property
   def supports_arbitrary_sharding(self) -> bool:
     return False
+
+  def __str__(self):
+    return f"{self.__class__.__name__}(tfds_dataset={str(self.tfds_dataset)})"
+
+  def __repr__(self):
+    return (
+        f"{self.__class__.__name__}(tfds_dataset={str(self.tfds_dataset)},"
+        f" splits={self.splits}, caching_permitted={self.caching_permitted})"
+    )
 
   def get_dataset(
       self,
@@ -534,7 +546,7 @@ class TfdsDataSource(DataSource):
         split, shuffle_files=shuffle, seed=seed, shard_info=shard_info
     )
 
-  def num_input_examples(self, split: str) -> int:
+  def num_input_examples(self, split: str) -> Optional[int]:
     """Overrides since we can't call `info.splits` until after init."""
     return self.tfds_dataset.size(split)
 
@@ -601,6 +613,20 @@ class FileDataSource(DataSource):
   @property
   def supports_arbitrary_sharding(self) -> bool:
     return False
+
+  def __str__(self):
+    return f"{self.__class__.__name__}({self._split_to_filepattern})"
+
+  def __repr__(self):
+    return (
+        f"{self.__class__.__name__}("
+        f"split_to_filepattern={self._split_to_filepattern},"
+        f" num_input_examples={self._num_input_examples},"
+        f" caching_permitted={self._caching_permitted},"
+        f" file_shuffle_buffer_size={self._file_shuffle_buffer_size},"
+        f" cycle_length={self._cycle_length},"
+        f" block_length={self._block_length})"
+    )
 
   def get_dataset(
       self,
@@ -766,6 +792,26 @@ class TFExampleDataSource(FileDataSource):
         file_shuffle_buffer_size=file_shuffle_buffer_size,
         cycle_length=cycle_length,
         block_length=block_length,
+    )
+
+  def __str__(self):
+    return (
+        f"{self.__class__.__name__}("
+        f"split_to_filepattern={self._split_to_filepattern},"
+        f" feature_description={self.feature_description})"
+    )
+
+  def __repr__(self):
+    return (
+        f"{self.__class__.__name__}("
+        f"split_to_filepattern={self._split_to_filepattern},"
+        f" feature_description={self.feature_description},"
+        f" reader_cls={self.reader_cls},"
+        f" num_input_examples={self._num_input_examples},"
+        f" caching_permitted={self._caching_permitted},"
+        f" file_shuffle_buffer_size={self._file_shuffle_buffer_size},"
+        f" cycle_length={self._cycle_length},"
+        f" block_length={self._block_length})"
     )
 
 
@@ -1059,6 +1105,9 @@ class Task(DatasetProviderBase):
   def name(self) -> str:
     return self._name
 
+  def __str__(self):
+    return f"Task(name={self.name}, source={str(self.source)})"
+
   @property
   def source_info(self) -> Optional[SourceInfo]:
     return self._source_info
@@ -1204,11 +1253,11 @@ class Task(DatasetProviderBase):
     return self._preprocessor_constructor_args
 
   @property
-  def postprocessor(self) -> Callable[..., Any]:
+  def postprocessor(self) -> Optional[Callable[..., Any]]:
     return self._postprocess_fn
 
   @property
-  def shuffle_buffer_size(self) -> int:
+  def shuffle_buffer_size(self) -> Optional[int]:
     return self._shuffle_buffer_size
 
   def replace(self, **kwargs):
@@ -1503,7 +1552,7 @@ class Task(DatasetProviderBase):
     elif shard_info:
       # Whether we should shard at source or on the examples from the source.
       shard_data_source = (
-          len(self.source.list_shards(split=split)) >= shard_info.num_shards
+          len(source.list_shards(split=split)) >= shard_info.num_shards
       )
       logging.info(
           "Sharding at the %s: %d of %d",
@@ -1531,8 +1580,8 @@ class Task(DatasetProviderBase):
             < _MAX_EXAMPLES_TO_MEM_CACHE
         )
         or (
-            self.num_input_examples(split)
-            and self.num_input_examples(split) < _MAX_EXAMPLES_TO_MEM_CACHE
+            source.num_input_examples(split)
+            and source.num_input_examples(split) < _MAX_EXAMPLES_TO_MEM_CACHE
         )
     ):
       logging.info(
