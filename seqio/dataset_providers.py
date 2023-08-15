@@ -471,9 +471,11 @@ class TfdsDataSource(DataSource):
 
   def __init__(
       self,
-      tfds_name: str,
+      tfds_name: Optional[str] = None,
       tfds_data_dir: Optional[str] = None,
-      splits: Optional[Union[Iterable[str], Mapping[str, str]]] = None,
+      splits: Optional[
+          Union[Iterable[str], Mapping[str, str], Mapping[str, utils.TfdsSplit]]
+      ] = None,
       caching_permitted: bool = True,
       decoders: Optional[tfds.typing.TreeDict[tfds.decode.Decoder]] = None,
   ):
@@ -481,15 +483,18 @@ class TfdsDataSource(DataSource):
 
     Args:
       tfds_name: The name and version number of a TFDS dataset, optionally with
-        a config.
+        a config. If `tfds_name` is not specified then `splits` values must be
+        instances of `TfdsSplit`.
       tfds_data_dir: An optional path to a specific TFDS data directory to use.
         If provided `tfds_name` must be a valid dataset in the directory. If
         `tfds_name` is empty `tfds_dara_dir` must point to the directory with
         one dataset.
       splits: an iterable of allowable string split names, a dict mapping
         allowable canonical splits (e.g., 'validation') to TFDS splits or slices
-        (e.g., 'train[':1%']), or None. The default, None, uses all available
-        splits from the TFDS dataset info.
+        (e.g., 'train[':1%']), or `TfdsSplit` (e.g. `TfdsSplit(dataset='mnist',
+        split='train')`), or None. The default, None, uses all available splits
+        from the TFDS dataset info. If `TfdsSplit` are used then `tfds_name`
+        must be empty.
       caching_permitted: indicates whether this data source may be cached.
         Default True.
       decoders: dict (optional), mapping from features to tfds.decode.Decoders,
@@ -741,7 +746,8 @@ class TFExampleDataSource(FileDataSource):
       self,
       split_to_filepattern: Mapping[str, Union[str, Iterable[str]]],
       feature_description: Mapping[
-          str, Union[tf.io.FixedLenFeature, tf.io.VarLenFeature]
+          str,
+          tf.io.FixedLenFeature | tf.io.VarLenFeature | tf.io.RaggedFeature,
       ],
       reader_cls: DatasetReaderType = tf.data.TFRecordDataset,
       num_input_examples: Optional[Mapping[str, int]] = None,
@@ -757,7 +763,8 @@ class TFExampleDataSource(FileDataSource):
         (filename or filepattern) or list of strings (filenames or
         filepatterns).
       feature_description: dict, a mapping of string feature keys to
-        `tf.io.FixedLenFeature` or `tf.io.VarLenFeature` values.
+        `tf.io.FixedLenFeature`, `tf.io.VarLenFeature`, or
+        `tf.io.RaggedFeature` values.
       reader_cls: `tf.data.Dataset`, a dataset class to read the input files.
       num_input_examples: dict or None, an optional dictionary mapping split to
         its size in number of input examples (before preprocessing). The
@@ -1573,15 +1580,17 @@ class Task(DatasetProviderBase):
       ds = source.get_dataset(split=split, shuffle=shuffle, seed=seed)
       ds = ds.shard(shard_info.num_shards, shard_info.index)
 
+    num_shards = shard_info.num_shards if shard_info else 1
     if try_in_mem_cache and (
         (
             use_cached
             and self.get_cached_stats(split)["examples"]
-            < _MAX_EXAMPLES_TO_MEM_CACHE
+            < _MAX_EXAMPLES_TO_MEM_CACHE * num_shards
         )
         or (
             source.num_input_examples(split)
-            and source.num_input_examples(split) < _MAX_EXAMPLES_TO_MEM_CACHE
+            and source.num_input_examples(split)
+            < _MAX_EXAMPLES_TO_MEM_CACHE * num_shards
         )
     ):
       logging.info(
