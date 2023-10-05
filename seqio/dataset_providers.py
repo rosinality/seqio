@@ -22,6 +22,7 @@ import abc
 import collections
 import dataclasses
 import functools
+import glob
 import inspect
 import json
 import numbers
@@ -685,7 +686,14 @@ class FileDataSource(DataSource):
 
   @functools.lru_cache(maxsize=1024)
   def list_shards(self, split: str) -> Sequence[str]:
-    return _list_files(pattern=self._split_to_filepattern[split])
+    filepattern = self._split_to_filepattern[split]
+    if isinstance(filepattern, str):
+      return _list_files(pattern=filepattern)
+
+    if not any(glob.has_magic(f) for f in filepattern):
+      return filepattern
+    else:
+      return _list_files(pattern=filepattern)
 
 
 
@@ -763,8 +771,8 @@ class TFExampleDataSource(FileDataSource):
         (filename or filepattern) or list of strings (filenames or
         filepatterns).
       feature_description: dict, a mapping of string feature keys to
-        `tf.io.FixedLenFeature`, `tf.io.VarLenFeature`, or
-        `tf.io.RaggedFeature` values.
+        `tf.io.FixedLenFeature`, `tf.io.VarLenFeature`, or `tf.io.RaggedFeature`
+        values.
       reader_cls: `tf.data.Dataset`, a dataset class to read the input files.
       num_input_examples: dict or None, an optional dictionary mapping split to
         its size in number of input examples (before preprocessing). The
@@ -926,11 +934,36 @@ class _CachedDataSource(FileDataSource):
           feat["dtype"] = "int32"
 
     # Use `FixedLenSequenceFeature` for sequences with variable length.
-    def _feature_config(shape, dtype):
+    def _feature_config(
+        key: str,
+        shape,
+        dtype: str,
+    ) -> Union[tf.io.FixedLenFeature, tf.io.RaggedFeature]:
       if dtype in ("int32", "bool"):
         # int32 and bool are stored as int64 in the tf.train.Example protobuf.
         # TODO(adarob): Support other conversions.
         dtype = "int64"
+      if shape:
+        num_none_components = 0
+        for x in shape[1:]:
+          if x is None:
+            num_none_components += 1
+        if num_none_components > 0:  # Parse as a ragged feature.
+          partitions = []
+          ragged_idx = 0
+          for x in shape[1:]:
+            if x is None:
+              partitions.append(
+                  tf.io.RaggedFeature.RowLengths(
+                      utils.tfexample_ragged_length_key(key, ragged_idx)
+                  )
+              )
+              ragged_idx += 1
+            else:
+              partitions.append(tf.io.RaggedFeature.UniformRowLength(x))
+          return tf.io.RaggedFeature(
+              value_key=key, partitions=partitions, dtype=dtype
+          )
       if shape and shape[0] is None:
         return tf.io.FixedLenSequenceFeature(
             shape[1:], dtype, allow_missing=True
@@ -938,7 +971,7 @@ class _CachedDataSource(FileDataSource):
       return tf.io.FixedLenFeature(shape, dtype)
 
     feature_description = {
-        feat: _feature_config(**desc) for feat, desc in features.items()
+        feat: _feature_config(feat, **desc) for feat, desc in features.items()
     }
 
     def read_file_fn(filepattern):
@@ -1894,7 +1927,7 @@ class Mixture(DatasetProviderBase):
       return {k: v for k, v in ex.items() if k in output_feature_keys}
 
     return task.get_dataset(
-        sequence_length,
+        sequence_length=sequence_length,
         split=split,
         use_cached=use_cached,
         shuffle=shuffle,
@@ -1932,7 +1965,8 @@ class Mixture(DatasetProviderBase):
         May be set to None to avoid truncation.
       split: string, the split to return for all tasks.
       use_cached: bool, whether to use the cached dataset instead of processing
-        it on the fly. Defaults to False.
+        it on the fly. This will be passed to the underlying Tasks in the
+        Mixture. Defaults to False.
       shuffle: bool, whether to shuffle the dataset.  Only used when generating
         on the fly (use_cached=False).
       seed: tf.int64 scalar tf.Tensor (or None) for shuffling tf.data.
@@ -2142,7 +2176,7 @@ def _log_mixing_proportions(
   else:
 
     def _estimated_mean_length(task, key):
-      if key not in sequence_length:
+      if sequence_length is None or key not in sequence_length:
         return 0
       if (
           task.supports_caching

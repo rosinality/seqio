@@ -30,8 +30,14 @@ class BeamUtilsTest(seqio.test_utils.FakeTaskTest):
 
   def test_preprocess_task(self):
     def _np_to_list(ex):
+      def _convert_value(v):
+        if isinstance(v, tf.Tensor):
+          v = v.numpy()
+          if isinstance(v, np.ndarray):
+            v = v.tolist()
+        return v
       return {
-          k: v.tolist() if isinstance(v, np.ndarray) else v
+          k: _convert_value(v)
           for k, v in ex.items()
       }
 
@@ -85,6 +91,24 @@ class BeamUtilsTest(seqio.test_utils.FakeTaskTest):
           ]),
       )
 
+  def test_preprocess_task_with_setup_fn(self):
+    with TestPipeline() as p:
+      pcoll = p | beam_utils.PreprocessTask(
+          task=seqio.get_mixture_or_task("tfds_task"),
+          split="train",
+          preprocessors_seed=42,
+          setup_fn=beam.metrics.Metrics.counter("test", "setup_fn_called").inc,
+          add_provenance=True,
+      )
+      result = p.run()
+      util.assert_that(pcoll, util.is_not_empty())
+
+      counters = result.metrics().query(
+          beam.metrics.MetricsFilter().with_name("setup_fn_called")
+      )["counters"]
+      self.assertLen(counters, 1)
+      self.assertGreater(counters[0].committed, 0)
+
   def test_write_example_tf_record(self):
     output_path = os.path.join(self.test_data_dir, "output.tfrecord")
     example = {
@@ -125,6 +149,10 @@ class BeamUtilsTest(seqio.test_utils.FakeTaskTest):
         "inputs": "test",
         "2d_shape": np.ones((1, 3), np.int32),
         "3d_shape": np.ones((1, 2, 3), np.int32),
+        "ragged_shape": tf.RaggedTensor.from_row_splits(
+            tf.constant([[3, 1], [4, 1], [5, 9]]),
+            row_splits=[0, 1, 3],
+            validate=True),
     }]
     with TestPipeline() as p:
       pcoll = p | beam.Create(input_examples) | beam_utils.GetInfo(num_shards=3)
@@ -141,6 +169,7 @@ class BeamUtilsTest(seqio.test_utils.FakeTaskTest):
                       "shape": [None, 2, 3],
                       "dtype": "int32",
                   },
+                  "ragged_shape": {"shape": [None, None, 2], "dtype": "int32"},
               },
               "seqio_version": seqio.__version__,
           }]),

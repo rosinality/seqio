@@ -19,7 +19,7 @@ import hashlib
 import importlib
 import json
 import operator
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from absl import logging
 import apache_beam as beam
@@ -61,6 +61,7 @@ class PreprocessTask(beam.PTransform):
       split: str,
       *,
       preprocessors_seed: Optional[int] = None,
+      setup_fn: Callable[[], None] = lambda: None,
       modules_to_import: Sequence[str] = (),
       add_provenance: bool = False,
       tfds_data_dir: Optional[str] = None,
@@ -72,6 +73,7 @@ class PreprocessTask(beam.PTransform):
       split: string, the split to process.
       preprocessors_seed: (Optional) int, a seed for stateless random ops in
         task preprocessing.
+      setup_fn: (Optional) callable, a function called before loading the task.
       modules_to_import: (Optional) list, modules to import.
       add_provenance: If True, provenance is added to each example.
       tfds_data_dir: (Optional) str, directory where the TFDS datasets are
@@ -83,6 +85,7 @@ class PreprocessTask(beam.PTransform):
     self._task_name = task.name
     self._split = split
     self._preprocessors_seed = preprocessors_seed
+    self._setup_fn = setup_fn
     self._modules_to_import = modules_to_import
     self._add_provenance = add_provenance
     self._tfds_data_dir = tfds_data_dir
@@ -106,6 +109,7 @@ class PreprocessTask(beam.PTransform):
 
   def _emit_examples(self, shard: Tuple[int, str]):
     """Emits examples keyed by shard number and index for a single shard."""
+    self._setup_fn()
     _import_modules(self._modules_to_import)
     task = seqio.TaskRegistry.get(self._task_name)
 
@@ -142,7 +146,8 @@ class PreprocessTask(beam.PTransform):
     ds = task.preprocess_precache(ds, seed=shard_preprocessors_seed)
     ds = ds.prefetch(tf.data.AUTOTUNE)
 
-    def _add_provenance(index_within_shard: int, ex: Dict[str, Any]):
+    def _add_provenance(
+        index_within_shard: int, ex: Dict[str, Any]) -> Dict[str, Any]:
       ex.update({
           TASK_PROVENANCE_KEY: self._task_name,
           SOURCE_SHARD_PROVENANCE_KEY: shard_name,
@@ -153,7 +158,7 @@ class PreprocessTask(beam.PTransform):
         ex.update({PREPROCESSORS_SEED_PROVENANCE_KEY: self._preprocessors_seed})
       return ex
 
-    for i, ex in enumerate(ds.as_numpy_iterator()):
+    for i, ex in enumerate(ds):
       if self._add_provenance:
         ex = _add_provenance(i, ex)
       self._increment_counter("examples")
@@ -255,7 +260,10 @@ class GetInfo(beam.PTransform):
     for k, v in ex.items():
       if self._exclude_provenance and k.startswith(PROVENANCE_PREFIX):
         continue
-      t = tf.constant(v)
+      if isinstance(v, tf.RaggedTensor):
+        t = v
+      else:
+        t = tf.constant(v)
       dtype = t.dtype.name
       shape = t.shape.as_list()
       # Keep all the dimensions but the first if t is not a scalar.
@@ -291,10 +299,14 @@ class _CountTokens(beam.DoFn):
     for name, feat in self._output_features.items():
       if (
           name in ex
-          and isinstance(ex[name], np.ndarray)
+          and (isinstance(ex[name], np.ndarray)
+               or isinstance(ex[name], tf.Tensor))
           and ex[name].dtype in (np.int32, np.int64)
       ):
-        values = ex[name]
+        if isinstance(ex[name], tf.Tensor):
+          values = ex[name].numpy()
+        else:
+          values = ex[name]
         conditions = []
         if feat.vocabulary.eos_id is not None:
           conditions.append((values != feat.vocabulary.eos_id))
@@ -414,6 +426,7 @@ class GetStats(beam.PTransform):
     self._output_features = output_features
     self._task_ids = task_ids or {}
     self._enable_char_counts = enable_char_counts
+    logging.info("Getting stats for output features: %s", str(output_features))
 
   def expand(self, pcoll):
     example_counts = (
