@@ -1400,13 +1400,13 @@ class DecoderFeatureConverter(FeatureConverter):
     # NOTE: __call__ can safely be overridden here because it is delegated to
     # other FeatureConverters - invoking their __call__ and associated checks.
     if "suffixes" in task_feature_lengths:
-      print('suffix')
+      logging.info('suffix')
       return self.prefixsuffixlm_feature_converter(ds, task_feature_lengths)
     if "inputs" in task_feature_lengths:
-      print('prefix', ds, task_feature_lengths)
+      logging.info(f'prefix {ds} {task_feature_lengths}')
       return self.prefixlm_feature_converter(ds, task_feature_lengths)
     else:
-      print('strictlm')
+      logging.info('strictlm')
       return self.strictlm_feature_converter(ds, task_feature_lengths)
 
   def _convert_features(
