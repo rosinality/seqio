@@ -1402,6 +1402,7 @@ class DecoderFeatureConverter(FeatureConverter):
     if "suffixes" in task_feature_lengths:
       return self.prefixsuffixlm_feature_converter(ds, task_feature_lengths)
     if "inputs" in task_feature_lengths:
+      print(ds, task_feature_lengths)
       return self.prefixlm_feature_converter(ds, task_feature_lengths)
     else:
       return self.strictlm_feature_converter(ds, task_feature_lengths)
